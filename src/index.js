@@ -19,69 +19,111 @@ function json(obj, status) {
 }
 
 function slug(s) {
-  return String(s || "foto")
+  return String(s || "pessoa")
     .toLowerCase()
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-|-$/g, "")
-    .slice(0, 40) || "foto";
+    .slice(0, 40) || "pessoa";
 }
 
-async function saveFoto(env, payload) {
-  const raw = payload.fotoDataUrl || "";
-  const m = String(raw).match(/^data:image\/(jpeg|jpg|png|webp);base64,([A-Za-z0-9+/=]+)$/);
-  if (!m) return null;
-  const token = env && env.GITHUB_TOKEN;
-  const ext = m[1] === "png" ? "png" : m[1] === "webp" ? "webp" : "jpg";
-  const path = "fotos/" + Date.now() + "-" + slug(payload.nome) + "." + ext;
+function digits(s) {
+  return String(s || "").replace(/\D/g, "");
+}
+
+function personDir(payload) {
+  const n = slug(payload.nome);
+  const wa = digits(payload.whatsapp).slice(-4);
+  return "pessoas/" + n + (wa ? "-" + wa : "");
+}
+
+function ghHeaders(token) {
+  return {
+    Authorization: "Bearer " + token,
+    Accept: "application/vnd.github+json",
+    "User-Agent": "jota-waba-hook",
+    "Content-Type": "application/json",
+  };
+}
+
+async function putFile(token, path, message, contentB64) {
+  const get = await fetch("https://api.github.com/repos/" + GH_REPO + "/contents/" + path, {
+    headers: ghHeaders(token),
+  });
+  let sha;
+  if (get.ok) {
+    const j = await get.json();
+    sha = j.sha;
+  }
   const r = await fetch("https://api.github.com/repos/" + GH_REPO + "/contents/" + path, {
     method: "PUT",
-    headers: {
-      Authorization: "Bearer " + token,
-      Accept: "application/vnd.github+json",
-      "User-Agent": "jota-waba-hook",
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      message: "foto cadastro " + (payload.nome || ""),
-      content: m[2],
-    }),
+    headers: ghHeaders(token),
+    body: JSON.stringify({ message: message, content: contentB64, sha: sha }),
   });
   const j = await r.json();
-  if (!r.ok) return { error: j.message || String(r.status) };
+  if (!r.ok) return { ok: false, error: j.message || String(r.status), path: path };
   const url = (j.content && j.content.download_url) || ("https://raw.githubusercontent.com/" + GH_REPO + "/main/" + path);
-  return { path: path, url: url };
+  return { ok: true, path: path, url: url, sha: j.content && j.content.sha };
 }
 
-async function saveIssue(env, payload, foto) {
+function utf8B64(s) {
+  return btoa(unescape(encodeURIComponent(s)));
+}
+
+async function savePasta(env, payload) {
+  const token = env && env.GITHUB_TOKEN;
+  if (!token) return { ok: false, error: "sem GITHUB_TOKEN" };
+  const dir = personDir(payload);
+  const slim = Object.assign({}, payload);
+  delete slim.fotoDataUrl;
+  slim.foto = Boolean(payload.fotoDataUrl);
+  slim.pasta = dir;
+  slim.updatedAt = new Date().toISOString();
+  const ficha = await putFile(token, dir + "/ficha.json", "ficha " + dir, utf8B64(JSON.stringify(slim, null, 2)));
+  if (!ficha.ok) return { ok: false, error: ficha.error, pasta: dir };
+  let foto = null;
+  const raw = payload.fotoDataUrl || "";
+  const m = String(raw).match(/^data:image\/(jpeg|jpg|png|webp);base64,([A-Za-z0-9+/=]+)$/);
+  if (m) {
+    const ext = m[1] === "png" ? "png" : m[1] === "webp" ? "webp" : "jpg";
+    foto = await putFile(token, dir + "/foto." + ext, "foto " + dir, m[2]);
+  }
+  return {
+    ok: true,
+    pasta: dir,
+    ficha: ficha.url,
+    foto: foto && foto.ok ? foto.url : null,
+    fotoError: foto && !foto.ok ? foto.error : null,
+  };
+}
+
+async function saveIssue(env, payload, pasta) {
   const token = env && env.GITHUB_TOKEN;
   if (!token) return { ok: false, error: "sem GITHUB_TOKEN" };
   const slim = Object.assign({}, payload);
   delete slim.fotoDataUrl;
-  slim.foto = foto && foto.url ? foto.url : !!payload.foto;
+  slim.foto = pasta && pasta.foto ? pasta.foto : !!payload.foto;
+  slim.pasta = pasta && pasta.pasta;
   const title =
     "[cadastro-time] " +
     (payload.nome || "sem nome") +
     " \u2014 " +
     (payload.papel_label || payload.papel || "");
   let body =
-    "## Cadastro do time (ops interno)\n\n```json\n" +
+    "## Cadastro do time (ops interno)\n\nPasta: `" +
+    (slim.pasta || "-") +
+    "`\n\n```json\n" +
     JSON.stringify(
       { type: "cadastro-time", source: "cloudflare-worker", payload: slim, sentAt: new Date().toISOString() },
       null,
       2
     ) +
     "\n```\n";
-  if (foto && foto.url) body += "\n![foto](" + foto.url + ")\n";
+  if (pasta && pasta.foto) body += "\n![foto](" + pasta.foto + ")\n";
   const r = await fetch("https://api.github.com/repos/" + GH_REPO + "/issues", {
     method: "POST",
-    headers: {
-      Authorization: "Bearer " + token,
-      Accept: "application/vnd.github+json",
-      "User-Agent": "jota-waba-hook",
-      "Content-Type": "application/json",
-    },
+    headers: ghHeaders(token),
     body: JSON.stringify({ title: title, body: body }),
   });
   const t = await r.text();
@@ -90,23 +132,29 @@ async function saveIssue(env, payload, foto) {
     j = JSON.parse(t);
   } catch (e) {}
   if (!r.ok) return { ok: false, error: "github " + r.status, detail: j.message || t.slice(0, 180) };
-  return { ok: true, number: j.number, foto: foto && foto.url };
+  return { ok: true, number: j.number, foto: pasta && pasta.foto, pasta: pasta && pasta.pasta };
 }
 
 async function listCadastros(env) {
   const token = env && env.GITHUB_TOKEN;
-  const r = await fetch("https://api.github.com/repos/" + GH_REPO + "/issues?state=open&per_page=50", {
-    headers: {
-      Authorization: token ? "Bearer " + token : undefined,
-      Accept: "application/vnd.github+json",
-      "User-Agent": "jota-waba-hook",
-    },
+  const r = await fetch("https://api.github.com/repos/" + GH_REPO + "/contents/pessoas", {
+    headers: ghHeaders(token),
   });
   const arr = await r.json();
-  if (!Array.isArray(arr)) return { ok: false, error: "github list", detail: arr.message };
+  if (!Array.isArray(arr)) {
+    const ir = await fetch("https://api.github.com/repos/" + GH_REPO + "/issues?state=open&per_page=50", {
+      headers: ghHeaders(token),
+    });
+    const issues = await ir.json();
+    if (!Array.isArray(issues)) return { ok: false, error: "github list" };
+    const items = issues
+      .filter((i) => String(i.title || "").indexOf("[cadastro-time]") === 0)
+      .map((i) => ({ number: i.number, title: i.title, created_at: i.created_at, url: i.html_url }));
+    return { ok: true, count: items.length, items: items };
+  }
   const items = arr
-    .filter((i) => String(i.title || "").indexOf("[cadastro-time]") === 0)
-    .map((i) => ({ number: i.number, title: i.title, created_at: i.created_at, url: i.html_url }));
+    .filter((x) => x.type === "dir")
+    .map((x) => ({ pasta: x.path, url: x.html_url }));
   return { ok: true, count: items.length, items: items };
 }
 
@@ -144,15 +192,27 @@ export default {
       if (!payload.nome || !payload.whatsapp || !payload.papel) {
         return json({ ok: false, error: "campos" }, 400);
       }
-      let foto = null;
-      try {
-        foto = await saveFoto(env, payload);
-      } catch (e) {
-        foto = { error: String(e) };
+      const pasta = await savePasta(env, payload);
+      if (!pasta.ok) return json({ ok: false, received: true, saved: false, error: pasta.error }, 502);
+      const saved = await saveIssue(env, payload, pasta);
+      if (!saved.ok) {
+        return json({
+          ok: true,
+          received: true,
+          saved: true,
+          pasta: pasta.pasta,
+          foto: pasta.foto,
+          issueError: saved.error,
+        }, 200);
       }
-      const saved = await saveIssue(env, payload, foto && foto.url ? foto : null);
-      if (!saved.ok) return json({ ok: false, received: true, saved: false, error: saved.error, detail: saved.detail }, 502);
-      return json({ ok: true, received: true, saved: true, number: saved.number, foto: saved.foto || null }, 200);
+      return json({
+        ok: true,
+        received: true,
+        saved: true,
+        number: saved.number,
+        pasta: pasta.pasta,
+        foto: pasta.foto,
+      }, 200);
     }
 
     if (path === "/healthz") {
