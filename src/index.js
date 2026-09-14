@@ -17,22 +17,62 @@ function json(obj, status) {
   });
 }
 
-async function saveIssue(env, payload) {
+function slug(s) {
+  return String(s || "foto")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 40) || "foto";
+}
+
+async function saveFoto(env, payload) {
+  const raw = payload.fotoDataUrl || "";
+  const m = String(raw).match(/^data:image\/(jpeg|jpg|png|webp);base64,([A-Za-z0-9+/=]+)$/);
+  if (!m) return null;
+  const token = env && env.GITHUB_TOKEN;
+  const ext = m[1] === "png" ? "png" : m[1] === "webp" ? "webp" : "jpg";
+  const path = "fotos/" + Date.now() + "-" + slug(payload.nome) + "." + ext;
+  const r = await fetch("https://api.github.com/repos/" + GH_REPO + "/contents/" + path, {
+    method: "PUT",
+    headers: {
+      Authorization: "Bearer " + token,
+      Accept: "application/vnd.github+json",
+      "User-Agent": "jota-waba-hook",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      message: "foto cadastro " + (payload.nome || ""),
+      content: m[2],
+    }),
+  });
+  const j = await r.json();
+  if (!r.ok) return { error: j.message || String(r.status) };
+  const url = (j.content && j.content.download_url) || ("https://raw.githubusercontent.com/" + GH_REPO + "/main/" + path);
+  return { path: path, url: url };
+}
+
+async function saveIssue(env, payload, foto) {
   const token = env && env.GITHUB_TOKEN;
   if (!token) return { ok: false, error: "sem GITHUB_TOKEN" };
+  const slim = Object.assign({}, payload);
+  delete slim.fotoDataUrl;
+  slim.foto = foto && foto.url ? foto.url : !!payload.foto;
   const title =
     "[cadastro-time] " +
     (payload.nome || "sem nome") +
     " \u2014 " +
     (payload.papel_label || payload.papel || "");
-  const body =
+  let body =
     "## Cadastro do time (ops interno)\n\n```json\n" +
     JSON.stringify(
-      { type: "cadastro-time", source: "cloudflare-worker", payload: payload, sentAt: new Date().toISOString() },
+      { type: "cadastro-time", source: "cloudflare-worker", payload: slim, sentAt: new Date().toISOString() },
       null,
       2
     ) +
     "\n```\n";
+  if (foto && foto.url) body += "\n![foto](" + foto.url + ")\n";
   const r = await fetch("https://api.github.com/repos/" + GH_REPO + "/issues", {
     method: "POST",
     headers: {
@@ -49,7 +89,7 @@ async function saveIssue(env, payload) {
     j = JSON.parse(t);
   } catch (e) {}
   if (!r.ok) return { ok: false, error: "github " + r.status, detail: j.message || t.slice(0, 180) };
-  return { ok: true, number: j.number, url: j.html_url };
+  return { ok: true, number: j.number, foto: foto && foto.url };
 }
 
 export default {
@@ -73,32 +113,15 @@ export default {
       if (!payload.nome || !payload.whatsapp || !payload.papel) {
         return json({ ok: false, error: "campos" }, 400);
       }
-      const saved = await saveIssue(env, payload);
+      let foto = null;
+      try {
+        foto = await saveFoto(env, payload);
+      } catch (e) {
+        foto = { error: String(e) };
+      }
+      const saved = await saveIssue(env, payload, foto && foto.url ? foto : null);
       if (!saved.ok) return json({ ok: false, received: true, saved: false, error: saved.error, detail: saved.detail }, 502);
-      return json({ ok: true, received: true, saved: true, number: saved.number }, 200);
-    }
-
-    if (path === "/api/cadastro-time" && request.method === "GET") {
-      const token = env && env.GITHUB_TOKEN;
-      if (!token) return json({ ok: false, error: "sem GITHUB_TOKEN" }, 502);
-      const r = await fetch("https://api.github.com/repos/" + GH_REPO + "/issues?state=open&per_page=50", {
-        headers: {
-          Authorization: "Bearer " + token,
-          Accept: "application/vnd.github+json",
-          "User-Agent": "jota-waba-hook",
-        },
-      });
-      const issues = await r.json();
-      const list = Array.isArray(issues)
-        ? issues
-            .filter(function (i) {
-              return String(i.title || "").indexOf("[cadastro-time]") === 0;
-            })
-            .map(function (i) {
-              return { number: i.number, title: i.title, created_at: i.created_at };
-            })
-        : [];
-      return json({ ok: true, count: list.length, items: list }, 200);
+      return json({ ok: true, received: true, saved: true, number: saved.number, foto: saved.foto || null }, 200);
     }
 
     if (path === "/healthz") {
@@ -118,24 +141,16 @@ export default {
     if (!isHook) return new Response("not found", { status: 404 });
 
     const token = (env && env.WABA_VERIFY_TOKEN) || FALLBACK_VERIFY;
-
     if (request.method === "GET") {
       const mode = url.searchParams.get("hub.mode") || "";
       const challenge = url.searchParams.get("hub.challenge") || "";
       const given = url.searchParams.get("hub.verify_token") || "";
       if (mode === "subscribe" && given === token) {
-        return new Response(challenge, {
-          status: 200,
-          headers: { "Content-Type": "text/plain; charset=utf-8" },
-        });
+        return new Response(challenge, { status: 200, headers: { "Content-Type": "text/plain; charset=utf-8" } });
       }
       return new Response("forbidden", { status: 403 });
     }
-
-    if (request.method === "POST") {
-      return new Response("EVENT_RECEIVED", { status: 200 });
-    }
-
+    if (request.method === "POST") return new Response("EVENT_RECEIVED", { status: 200 });
     return new Response("method", { status: 405 });
   },
 };
