@@ -1,6 +1,7 @@
 const FALLBACK_VERIFY = "grupojet-jota-0800";
 const JOTA_DEFAULT = "https://jota.grupojet.com.br";
 const GH_REPO = "grupojet/cadastro-time";
+const FORM_SRC = "https://raw.githubusercontent.com/grupojet/cadastro-time/main/form.html";
 
 function cors() {
   return {
@@ -92,6 +93,23 @@ async function saveIssue(env, payload, foto) {
   return { ok: true, number: j.number, foto: foto && foto.url };
 }
 
+async function listCadastros(env) {
+  const token = env && env.GITHUB_TOKEN;
+  const r = await fetch("https://api.github.com/repos/" + GH_REPO + "/issues?state=open&per_page=50", {
+    headers: {
+      Authorization: token ? "Bearer " + token : undefined,
+      Accept: "application/vnd.github+json",
+      "User-Agent": "jota-waba-hook",
+    },
+  });
+  const arr = await r.json();
+  if (!Array.isArray(arr)) return { ok: false, error: "github list", detail: arr.message };
+  const items = arr
+    .filter((i) => String(i.title || "").indexOf("[cadastro-time]") === 0)
+    .map((i) => ({ number: i.number, title: i.title, created_at: i.created_at, url: i.html_url }));
+  return { ok: true, count: items.length, items: items };
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -100,6 +118,19 @@ export default {
 
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: cors() });
+    }
+
+    if ((path === "/cadastro" || path === "/form") && request.method === "GET") {
+      const r = await fetch(FORM_SRC, { headers: { "User-Agent": "jota-waba-hook" } });
+      const html = await r.text();
+      return new Response(html, {
+        status: r.ok ? 200 : 502,
+        headers: { "Content-Type": "text/html; charset=utf-8", ...cors() },
+      });
+    }
+
+    if (path === "/api/cadastro-time" && request.method === "GET") {
+      return json(await listCadastros(env), 200);
     }
 
     if (path === "/api/cadastro-time" && request.method === "POST") {
