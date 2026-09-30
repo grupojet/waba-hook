@@ -158,6 +158,22 @@ async function listCadastros(env) {
   return { ok: true, count: items.length, items: items };
 }
 
+async function forwardJota(env, payload) {
+  const jota = ((env && env.JOTA_ORIGIN) || JOTA_DEFAULT).replace(/\/+$/, "");
+  const headers = { "Content-Type": "application/json", "User-Agent": "jota-waba-hook" };
+  if (env && env.JOTA_INGEST_TOKEN) headers["X-Jota-Ingest"] = env.JOTA_INGEST_TOKEN;
+  try {
+    const r = await fetch(jota + "/api/omni/waba", {
+      method: "POST",
+      headers: headers,
+      body: JSON.stringify(payload),
+    });
+    return { ok: r.ok, status: r.status };
+  } catch (e) {
+    return { ok: false, error: String(e && e.message ? e.message : e) };
+  }
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -241,7 +257,22 @@ export default {
       }
       return new Response("forbidden", { status: 403 });
     }
-    if (request.method === "POST") return new Response("EVENT_RECEIVED", { status: 200 });
+    if (request.method === "POST") {
+      let payload = {};
+      try {
+        payload = await request.json();
+      } catch (e) {
+        payload = {};
+      }
+      const fwd = await forwardJota(env, payload);
+      return new Response("EVENT_RECEIVED", {
+        status: 200,
+        headers: {
+          "Content-Type": "text/plain; charset=utf-8",
+          "X-Jota-Forward": fwd.ok ? "ok" : "fail",
+        },
+      });
+    }
     return new Response("method", { status: 405 });
   },
 };
