@@ -9,6 +9,8 @@
 // - Sem CORS: nenhuma rota e chamada por navegador.
 
 const JOTA_DEFAULT = "https://jota.grupojet.com.br";
+// Prazo das chamadas ao destino: destino lento nao segura a resposta a Meta.
+const FORWARD_TIMEOUT_MS = 10000;
 const enc = new TextEncoder();
 
 function text(body, status, extra) {
@@ -47,7 +49,7 @@ async function forwardJota(env, rawBody, signature) {
   };
   if (env && env.JOTA_INGEST_TOKEN) headers["X-Jota-Ingest"] = env.JOTA_INGEST_TOKEN;
   try {
-    const r = await fetch(jota + "/api/omni/waba", { method: "POST", headers: headers, body: rawBody });
+    const r = await fetch(jota + "/api/omni/waba", { method: "POST", headers: headers, body: rawBody, signal: AbortSignal.timeout(FORWARD_TIMEOUT_MS) });
     return { ok: r.ok, status: r.status };
   } catch (e) {
     return { ok: false, status: 0 };
@@ -66,7 +68,7 @@ export default {
 
     if (path === "/healthz" && request.method === "GET") {
       try {
-        const r = await fetch(jota.replace(/\/+$/, "") + "/healthz", { method: "GET" });
+        const r = await fetch(jota.replace(/\/+$/, "") + "/healthz", { method: "GET", signal: AbortSignal.timeout(FORWARD_TIMEOUT_MS) });
         return text(r.ok ? "ok" : "jota " + r.status, r.ok ? 200 : 502);
       } catch (e) {
         return text("jota down", 502);
@@ -92,8 +94,13 @@ export default {
       const sig = request.headers.get("x-hub-signature-256") || "";
       if (!(await validSignature(secret, raw, sig))) return text("invalid signature", 401);
       const fwd = await forwardJota(env, raw, sig);
-      // Falha no destino = 502: a Meta reenvia (antes respondia 200 e o evento se perdia).
-      if (!fwd.ok) return text("forward failed", 502, { "X-Jota-Forward": "fail" });
+      // Falha transitoria (5xx, rede, prazo) = 502: a Meta reenvia. O destino deduplica por evento.
+      if (fwd.status === 0 || fwd.status >= 500) return text("forward failed", 502, { "X-Jota-Forward": "fail" });
+      // 4xx = recusa permanente (credencial, corpo): reenviar nao resolve; 200 + log (so o status, sem corpo).
+      if (!fwd.ok) {
+        console.error("jota-waba-hook: destino recusou o evento, status " + fwd.status);
+        return text("EVENT_RECEIVED", 200, { "X-Jota-Forward": "rejected" });
+      }
       return text("EVENT_RECEIVED", 200, { "X-Jota-Forward": "ok" });
     }
 

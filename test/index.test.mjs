@@ -53,6 +53,50 @@ test("destino fora do ar = 502 para a Meta reenviar", async () => {
   assert.equal(r.status, 502);
 });
 
+test("destino 4xx (permanente) = 200 para a Meta nao reenviar por dias", async () => {
+  for (const st of [400, 401, 403, 404, 413]) {
+    globalThis.fetch = async () => new Response("x", { status: st });
+    const r = await worker.fetch(post(BODY, { "x-hub-signature-256": sign(BODY) }), ENV);
+    assert.equal(r.status, 200, "destino " + st);
+    assert.equal(r.headers.get("x-jota-forward"), "rejected");
+  }
+});
+
+test("destino 5xx e falha de rede (fetch lanca) = 502", async () => {
+  for (const st of [500, 502, 503, 504]) {
+    globalThis.fetch = async () => new Response("x", { status: st });
+    const r = await worker.fetch(post(BODY, { "x-hub-signature-256": sign(BODY) }), ENV);
+    assert.equal(r.status, 502, "destino " + st);
+  }
+  globalThis.fetch = async () => { throw new TypeError("network"); };
+  const r = await worker.fetch(post(BODY, { "x-hub-signature-256": sign(BODY) }), ENV);
+  assert.equal(r.status, 502);
+});
+
+test("fetch ao destino e ao healthz tem prazo (AbortSignal)", async () => {
+  const signals = [];
+  globalThis.fetch = async (url, init = {}) => { signals.push(init.signal); return new Response("ok", { status: 200 }); };
+  await worker.fetch(post(BODY, { "x-hub-signature-256": sign(BODY) }), ENV);
+  await worker.fetch(new Request("https://hook.invalid/healthz"), ENV);
+  assert.equal(signals.length, 2);
+  for (const s of signals) assert.ok(s instanceof AbortSignal, "fetch sem signal");
+  // Prazo estourado (AbortSignal.timeout lanca TimeoutError) = falha transitoria = 502.
+  globalThis.fetch = async () => { throw new DOMException("timeout", "TimeoutError"); };
+  const r = await worker.fetch(post(BODY, { "x-hub-signature-256": sign(BODY) }), ENV);
+  assert.equal(r.status, 502);
+});
+
+test("assinatura em hex maiusculo e aceita", async () => {
+  const r = await worker.fetch(post(BODY, { "x-hub-signature-256": "sha256=" + sign(BODY).slice(7).toUpperCase() }), ENV);
+  assert.equal(r.status, 200);
+});
+
+test("metodo nao suportado no webhook = 405", async () => {
+  const r = await worker.fetch(new Request("https://hook.invalid/webhook/waba", { method: "PUT", body: "{}" }), ENV);
+  assert.equal(r.status, 405);
+  assert.equal(calls.length, 0);
+});
+
 test("verify GET: so com token da env; sem env sempre 403", async () => {
   const q = (t) => new Request(`https://hook.invalid/webhook/waba?hub.mode=subscribe&hub.challenge=123&hub.verify_token=${t}`);
   let r = await worker.fetch(q(VERIFY), ENV);
