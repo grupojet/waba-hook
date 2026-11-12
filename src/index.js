@@ -1,176 +1,56 @@
-const FALLBACK_VERIFY = "grupojet-jota-0800";
+// jota-waba-hook: webhook da Cloud API (Meta) -> JOTA_ORIGIN/api/omni/waba.
+//
+// Seguranca (auditoria 11/11/2026):
+// - POST so e encaminhado com X-Hub-Signature-256 valido (HMAC-SHA256 do corpo cru com WABA_APP_SECRET).
+//   Sem WABA_APP_SECRET configurado: nada e encaminhado (fail-closed).
+// - Verify token so vem da env WABA_VERIFY_TOKEN (sem valor embutido no codigo).
+// - Rotas de cadastro do time (/cadastro, /form, /api/cadastro-time) removidas: o formulario mudou
+//   para o JOTA em 30/09 e o repo de cadastro agora e privado. Respondem 410.
+// - Sem CORS: nenhuma rota e chamada por navegador.
+
 const JOTA_DEFAULT = "https://jota.grupojet.com.br";
-const GH_REPO = "grupojet/cadastro-time";
-const FORM_SRC = "https://raw.githubusercontent.com/grupojet/cadastro-time/main/form.html";
+const enc = new TextEncoder();
 
-function cors() {
-  return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
-  };
+function text(body, status, extra) {
+  return new Response(body, { status: status, headers: { "Content-Type": "text/plain; charset=utf-8", ...(extra || {}) } });
 }
 
-function json(obj, status) {
-  return new Response(JSON.stringify(obj), {
-    status: status,
-    headers: { "Content-Type": "application/json; charset=utf-8", ...cors() },
-  });
+function hex(buf) {
+  return Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-function slug(s) {
-  return String(s || "pessoa")
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-|-$/g, "")
-    .slice(0, 40) || "pessoa";
+function safeEqual(a, b) {
+  const x = String(a);
+  const y = String(b);
+  if (x.length !== y.length) return false;
+  let d = 0;
+  for (let i = 0; i < x.length; i++) d |= x.charCodeAt(i) ^ y.charCodeAt(i);
+  return d === 0;
 }
 
-function digits(s) {
-  return String(s || "").replace(/\D/g, "");
+export async function validSignature(secret, rawBody, header) {
+  if (!secret) return false;
+  const m = /^sha256=([0-9a-f]{64})$/i.exec(String(header || "").trim());
+  if (!m) return false;
+  const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const mac = await crypto.subtle.sign("HMAC", key, rawBody);
+  return safeEqual(hex(mac), m[1].toLowerCase());
 }
 
-function personDir(payload) {
-  const n = slug(payload.nome);
-  const wa = digits(payload.whatsapp).slice(-4);
-  return "pessoas/" + n + (wa ? "-" + wa : "");
-}
-
-function ghHeaders(token) {
-  return {
-    Authorization: "Bearer " + token,
-    Accept: "application/vnd.github+json",
-    "User-Agent": "jota-waba-hook",
-    "Content-Type": "application/json",
-  };
-}
-
-async function putFile(token, path, message, contentB64) {
-  const get = await fetch("https://api.github.com/repos/" + GH_REPO + "/contents/" + path, {
-    headers: ghHeaders(token),
-  });
-  let sha;
-  if (get.ok) {
-    const j = await get.json();
-    sha = j.sha;
-  }
-  const r = await fetch("https://api.github.com/repos/" + GH_REPO + "/contents/" + path, {
-    method: "PUT",
-    headers: ghHeaders(token),
-    body: JSON.stringify({ message: message, content: contentB64, sha: sha }),
-  });
-  const j = await r.json();
-  if (!r.ok) return { ok: false, error: j.message || String(r.status), path: path };
-  const url = (j.content && j.content.download_url) || ("https://raw.githubusercontent.com/" + GH_REPO + "/main/" + path);
-  return { ok: true, path: path, url: url, sha: j.content && j.content.sha };
-}
-
-function utf8B64(s) {
-  return btoa(unescape(encodeURIComponent(s)));
-}
-
-async function savePasta(env, payload) {
-  const token = env && env.GITHUB_TOKEN;
-  if (!token) return { ok: false, error: "sem GITHUB_TOKEN" };
-  const dir = personDir(payload);
-  const slim = Object.assign({}, payload);
-  delete slim.fotoDataUrl;
-  slim.foto = Boolean(payload.fotoDataUrl);
-  slim.pasta = dir;
-  slim.updatedAt = new Date().toISOString();
-  const ficha = await putFile(token, dir + "/ficha.json", "ficha " + dir, utf8B64(JSON.stringify(slim, null, 2)));
-  if (!ficha.ok) return { ok: false, error: ficha.error, pasta: dir };
-  let foto = null;
-  const raw = payload.fotoDataUrl || "";
-  const m = String(raw).match(/^data:image\/(jpeg|jpg|png|webp);base64,([A-Za-z0-9+/=]+)$/);
-  if (m) {
-    const ext = m[1] === "png" ? "png" : m[1] === "webp" ? "webp" : "jpg";
-    foto = await putFile(token, dir + "/foto." + ext, "foto " + dir, m[2]);
-  }
-  return {
-    ok: true,
-    pasta: dir,
-    ficha: ficha.url,
-    foto: foto && foto.ok ? foto.url : null,
-    fotoError: foto && !foto.ok ? foto.error : null,
-  };
-}
-
-async function saveIssue(env, payload, pasta) {
-  const token = env && env.GITHUB_TOKEN;
-  if (!token) return { ok: false, error: "sem GITHUB_TOKEN" };
-  const slim = Object.assign({}, payload);
-  delete slim.fotoDataUrl;
-  slim.foto = pasta && pasta.foto ? pasta.foto : !!payload.foto;
-  slim.pasta = pasta && pasta.pasta;
-  const title =
-    "[cadastro-time] " +
-    (payload.nome || "sem nome") +
-    " \u2014 " +
-    (payload.papel_label || payload.papel || "");
-  let body =
-    "## Cadastro do time (ops interno)\n\nPasta: `" +
-    (slim.pasta || "-") +
-    "`\n\n```json\n" +
-    JSON.stringify(
-      { type: "cadastro-time", source: "cloudflare-worker", payload: slim, sentAt: new Date().toISOString() },
-      null,
-      2
-    ) +
-    "\n```\n";
-  if (pasta && pasta.foto) body += "\n![foto](" + pasta.foto + ")\n";
-  const r = await fetch("https://api.github.com/repos/" + GH_REPO + "/issues", {
-    method: "POST",
-    headers: ghHeaders(token),
-    body: JSON.stringify({ title: title, body: body }),
-  });
-  const t = await r.text();
-  let j = {};
-  try {
-    j = JSON.parse(t);
-  } catch (e) {}
-  if (!r.ok) return { ok: false, error: "github " + r.status, detail: j.message || t.slice(0, 180) };
-  return { ok: true, number: j.number, foto: pasta && pasta.foto, pasta: pasta && pasta.pasta };
-}
-
-async function listCadastros(env) {
-  const token = env && env.GITHUB_TOKEN;
-  const r = await fetch("https://api.github.com/repos/" + GH_REPO + "/contents/pessoas", {
-    headers: ghHeaders(token),
-  });
-  const arr = await r.json();
-  if (!Array.isArray(arr)) {
-    const ir = await fetch("https://api.github.com/repos/" + GH_REPO + "/issues?state=open&per_page=50", {
-      headers: ghHeaders(token),
-    });
-    const issues = await ir.json();
-    if (!Array.isArray(issues)) return { ok: false, error: "github list" };
-    const items = issues
-      .filter((i) => String(i.title || "").indexOf("[cadastro-time]") === 0)
-      .map((i) => ({ number: i.number, title: i.title, created_at: i.created_at, url: i.html_url }));
-    return { ok: true, count: items.length, items: items };
-  }
-  const items = arr
-    .filter((x) => x.type === "dir")
-    .map((x) => ({ pasta: x.path, url: x.html_url }));
-  return { ok: true, count: items.length, items: items };
-}
-
-async function forwardJota(env, payload) {
+async function forwardJota(env, rawBody, signature) {
   const jota = ((env && env.JOTA_ORIGIN) || JOTA_DEFAULT).replace(/\/+$/, "");
-  const headers = { "Content-Type": "application/json", "User-Agent": "jota-waba-hook" };
+  const headers = {
+    "Content-Type": "application/json",
+    "User-Agent": "jota-waba-hook",
+    // Repassa a assinatura original: o destino pode revalidar sobre o mesmo corpo cru.
+    "X-Hub-Signature-256": signature,
+  };
   if (env && env.JOTA_INGEST_TOKEN) headers["X-Jota-Ingest"] = env.JOTA_INGEST_TOKEN;
   try {
-    const r = await fetch(jota + "/api/omni/waba", {
-      method: "POST",
-      headers: headers,
-      body: JSON.stringify(payload),
-    });
+    const r = await fetch(jota + "/api/omni/waba", { method: "POST", headers: headers, body: rawBody });
     return { ok: r.ok, status: r.status };
   } catch (e) {
-    return { ok: false, error: String(e && e.message ? e.message : e) };
+    return { ok: false, status: 0 };
   }
 }
 
@@ -180,99 +60,43 @@ export default {
     const path = url.pathname.replace(/\/+$/, "") || "/";
     const jota = (env && env.JOTA_ORIGIN) || JOTA_DEFAULT;
 
-    if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: cors() });
+    if (path === "/cadastro" || path === "/form" || path === "/api/cadastro-time") {
+      return text("gone", 410);
     }
 
-    if ((path === "/cadastro" || path === "/form") && request.method === "GET") {
-      const r = await fetch(FORM_SRC, { headers: { "User-Agent": "jota-waba-hook" } });
-      const html = await r.text();
-      return new Response(html, {
-        status: r.ok ? 200 : 502,
-        headers: { "Content-Type": "text/html; charset=utf-8", ...cors() },
-      });
-    }
-
-    if (path === "/api/cadastro-time" && request.method === "GET") {
-      return json(await listCadastros(env), 200);
-    }
-
-    if (path === "/api/cadastro-time" && request.method === "POST") {
-      let body = {};
-      try {
-        body = await request.json();
-      } catch (e) {
-        return json({ ok: false, error: "json" }, 400);
-      }
-      const payload = body.payload || body;
-      if (!payload.nome || !payload.whatsapp || !payload.papel) {
-        return json({ ok: false, error: "campos" }, 400);
-      }
-      const pasta = await savePasta(env, payload);
-      if (!pasta.ok) return json({ ok: false, received: true, saved: false, error: pasta.error }, 502);
-      const saved = await saveIssue(env, payload, pasta);
-      if (!saved.ok) {
-        return json({
-          ok: true,
-          received: true,
-          saved: true,
-          pasta: pasta.pasta,
-          foto: pasta.foto,
-          issueError: saved.error,
-        }, 200);
-      }
-      return json({
-        ok: true,
-        received: true,
-        saved: true,
-        number: saved.number,
-        pasta: pasta.pasta,
-        foto: pasta.foto,
-      }, 200);
-    }
-
-    if (path === "/healthz") {
+    if (path === "/healthz" && request.method === "GET") {
       try {
         const r = await fetch(jota.replace(/\/+$/, "") + "/healthz", { method: "GET" });
-        const t = await r.text();
-        return new Response(t, {
-          status: r.status,
-          headers: { "Content-Type": "text/plain; charset=utf-8", ...cors() },
-        });
+        return text(r.ok ? "ok" : "jota " + r.status, r.ok ? 200 : 502);
       } catch (e) {
-        return new Response("jota down", { status: 502, headers: cors() });
+        return text("jota down", 502);
       }
     }
 
     const isHook = path === "/webhook/waba" || path === "/";
-    if (!isHook) return new Response("not found", { status: 404 });
+    if (!isHook) return text("not found", 404);
 
-    const token = (env && env.WABA_VERIFY_TOKEN) || FALLBACK_VERIFY;
     if (request.method === "GET") {
+      const want = String((env && env.WABA_VERIFY_TOKEN) || "");
       const mode = url.searchParams.get("hub.mode") || "";
       const challenge = url.searchParams.get("hub.challenge") || "";
       const given = url.searchParams.get("hub.verify_token") || "";
-      if (mode === "subscribe" && given === token) {
-        return new Response(challenge, { status: 200, headers: { "Content-Type": "text/plain; charset=utf-8" } });
-      }
-      return new Response("forbidden", { status: 403 });
+      if (want && mode === "subscribe" && safeEqual(given, want)) return text(challenge, 200);
+      return text("forbidden", 403);
     }
+
     if (request.method === "POST") {
-      let payload = {};
-      try {
-        payload = await request.json();
-      } catch (e) {
-        payload = {};
-      }
-      const fwd = await forwardJota(env, payload);
-      return new Response("EVENT_RECEIVED", {
-        status: 200,
-        headers: {
-          "Content-Type": "text/plain; charset=utf-8",
-          "X-Jota-Forward": fwd.ok ? "ok" : "fail",
-        },
-      });
+      const secret = String((env && env.WABA_APP_SECRET) || "");
+      if (!secret) return text("misconfigured", 503);
+      const raw = await request.arrayBuffer();
+      const sig = request.headers.get("x-hub-signature-256") || "";
+      if (!(await validSignature(secret, raw, sig))) return text("invalid signature", 401);
+      const fwd = await forwardJota(env, raw, sig);
+      // Falha no destino = 502: a Meta reenvia (antes respondia 200 e o evento se perdia).
+      if (!fwd.ok) return text("forward failed", 502, { "X-Jota-Forward": "fail" });
+      return text("EVENT_RECEIVED", 200, { "X-Jota-Forward": "ok" });
     }
-    return new Response("method", { status: 405 });
+
+    return text("method", 405);
   },
 };
