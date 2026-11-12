@@ -94,9 +94,15 @@ export default {
       const sig = request.headers.get("x-hub-signature-256") || "";
       if (!(await validSignature(secret, raw, sig))) return text("invalid signature", 401);
       const fwd = await forwardJota(env, raw, sig);
-      // Falha transitoria (5xx, rede, prazo) = 502: a Meta reenvia. O destino deduplica por evento.
-      if (fwd.status === 0 || fwd.status >= 500) return text("forward failed", 502, { "X-Jota-Forward": "fail" });
-      // 4xx = recusa permanente (credencial, corpo): reenviar nao resolve; 200 + log (so o status, sem corpo).
+      // Falha transitoria ou corrigivel = 502: a Meta reenvia. O destino deduplica por evento.
+      // Inclui 5xx, rede, prazo, 408/429 (podem vir da borda na frente do tunel) e 401/403
+      // (token divergente entre worker e destino: responder 200 perderia TODOS os eventos em silencio).
+      const st = fwd.status;
+      if (st === 0 || st >= 500 || st === 401 || st === 403 || st === 408 || st === 429) {
+        if (st === 401 || st === 403) console.error("jota-waba-hook: destino recusou a credencial, status " + st);
+        return text("forward failed", 502, { "X-Jota-Forward": "fail" });
+      }
+      // Demais 4xx = recusa permanente do corpo: reenviar nao resolve; 200 + log (so o status, sem corpo).
       if (!fwd.ok) {
         console.error("jota-waba-hook: destino recusou o evento, status " + fwd.status);
         return text("EVENT_RECEIVED", 200, { "X-Jota-Forward": "rejected" });

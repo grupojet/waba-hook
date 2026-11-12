@@ -54,11 +54,20 @@ test("destino fora do ar = 502 para a Meta reenviar", async () => {
 });
 
 test("destino 4xx (permanente) = 200 para a Meta nao reenviar por dias", async () => {
-  for (const st of [400, 401, 403, 404, 413]) {
+  for (const st of [400, 404, 413, 422]) {
     globalThis.fetch = async () => new Response("x", { status: st });
     const r = await worker.fetch(post(BODY, { "x-hub-signature-256": sign(BODY) }), ENV);
     assert.equal(r.status, 200, "destino " + st);
     assert.equal(r.headers.get("x-jota-forward"), "rejected");
+  }
+});
+
+test("destino 401/403/408/429 (credencial divergente, prazo, limite) = 502 para a Meta reenviar", async () => {
+  for (const st of [401, 403, 408, 429]) {
+    globalThis.fetch = async () => new Response("x", { status: st });
+    const r = await worker.fetch(post(BODY, { "x-hub-signature-256": sign(BODY) }), ENV);
+    assert.equal(r.status, 502, "destino " + st);
+    assert.equal(r.headers.get("x-jota-forward"), "fail");
   }
 });
 

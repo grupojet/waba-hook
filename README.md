@@ -25,5 +25,5 @@ Secrets do worker (`npx wrangler secret put <NOME>`): `WABA_APP_SECRET`, `WABA_V
 ## Teste
 
 ```bash
-node --test test/
+node --test test/index.test.mjs
 ```
